@@ -16,15 +16,7 @@ function findChats(query) {
 }
 
 function countChats() {
-  return new Promise((resolve, reject) => {
-    return Chat.count({}, (err, count) => {
-      if (err) {
-        reject(err)
-      } else {
-        resolve(count)
-      }
-    })
-  })
+  return Chat.estimatedDocumentCount();
 }
 
 function findVoices(query) {
@@ -32,144 +24,163 @@ function findVoices(query) {
 }
 
 function getDuration() {
-  return new Promise((resolve, reject) => {
-    Voice.aggregate(
-      {
-        $group: {
-          _id: '',
-          duration: { $sum: '$duration' },
-        },
+  return Voice.aggregate([
+    {
+      $group: {
+        _id: null,
+        duration: { $sum: '$duration' },
       },
-      (err, result) => {
-        if (err) {
-          reject(err)
-        } else {
-          resolve(parseInt(result[0]?.duration || '0', 10))
-        }
-      }
-    )
-  })
+    },
+  ]).then(result => {
+    return parseInt(result[0]?.duration || '0', 10);
+  });
 }
 
-function generateWordCount() {
-  const start = new Date()
-  Word.remove({}, () => {
-    console.log('start generating word count')
-    let words = {}
+async function generateWordCount() {
+  const start = new Date();
+  
+  try {
+    console.log('Starting word count generation...');
+    
+    // Remove existing word count data
+    await Word.deleteMany({});
+    
+    console.log('Fetching voices for word count generation...');
+    const voices = await Voice.find({}).lean(); // Use lean() for better performance
+    
+    const words = {};
 
-    const cursor = Voice.find({}).then((voices) => {
-      voices.forEach((voice) => {
-        if (voice.text && voice.text.length > 3) {
-          voice.text
-            .toLowerCase()
-            .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, '')
-            .split(' ')
-            .forEach((word) => {
-              if (word.length > 3) {
-                if (words[word]) {
-                  words[word] += 1
-                } else {
-                  words[word] = 1
-                }
-              }
-            })
-        }
-      })
-      let ops = []
+    voices.forEach((voice) => {
+      if (voice.text && voice.text.length > 3) {
+        voice.text
+          .toLowerCase()
+          .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, '')
+          .split(' ')
+          .forEach((word) => {
+            if (word.length > 3) {
+              words[word] = (words[word] || 0) + 1;
+            }
+          });
+      }
+    });
 
-      Object.keys(words).forEach((k) => {
-        const p = new Promise((res, rej) => {
-          const newWord = new Word({ word: String(k), count: words[k] })
-          newWord
-            .save()
-            .then(() => {
-              res()
-            })
-            .catch((err) => {
-              rej(err)
-            })
-        })
-        ops.push(p)
-      })
-      console.log('start promises')
-      Promise.all(ops)
-        .then(() => {
-          const end = new Date() - start
-          console.info('word count generated in: %dms', end)
-        })
-        .catch((err) => {
-          console.log(`word count generation failed: ${err.message}`)
-        })
-    })
-  })
+    console.log(`Processing ${Object.keys(words).length} unique words...`);
+    
+    // Use insertMany for better performance instead of individual saves
+    const wordDocuments = Object.entries(words).map(([word, count]) => ({
+      word: String(word),
+      count: count
+    }));
+    
+    // Insert in batches to avoid memory issues
+    const batchSize = 1000;
+    for (let i = 0; i < wordDocuments.length; i += batchSize) {
+      const batch = wordDocuments.slice(i, i + batchSize);
+      await Word.insertMany(batch);
+    }
+
+    const end = new Date() - start;
+    console.log(`Word count generation completed in: ${end}ms`);
+    
+  } catch (err) {
+    console.error(`Word count generation failed: ${err.message}`);
+    throw err;
+  }
 }
 
 function getWordCount() {
   return Word.find({}).sort({ count: -1 }).limit(20)
 }
 
-function getStats() {
-  return new Promise((resolve, reject) => {
-    Stats.findOne()
-      .then((stats) => {
-        MessageStats.find().then((messageStats) => {
-          const json = JSON.parse(stats.json)
-          json.messageStats = messageStats.filter((stat) => stat.count > 50000)
-          resolve(json)
-        })
-      })
-      .catch((err) => reject(err))
-  })
+async function getStats() {
+  try {
+    const stats = await Stats.findOne();
+    if (!stats) {
+      throw new Error('No stats found in database');
+    }
+    
+    const messageStats = await MessageStats.find();
+    const json = JSON.parse(stats.json);
+    json.messageStats = messageStats.filter((stat) => stat.count > 50000);
+    
+    return json;
+  } catch (err) {
+    console.error('Error getting stats:', err);
+    throw err;
+  }
 }
 
 async function getNewStats() {
-  console.log('getting stats')
-  // Extra numbers of records that don't exist anymore after the cleanup but still contribute to the stats
-  const extraVoiceCount =
-    16472966 + 140155 + 10228067 + 24327202 + 23724547 + 48066867
-  const extraDuration =
-    185936897 +
-    2245600 +
-    147045183 +
-    344688480 +
-    7780507 +
-    352478725 +
-    297266368
-  // Get result dummy variable
-  const result = {}
-  // Get response stats
-  if (fs.existsSync(`${__dirname}/../../voicy/updates.log`)) {
-    result.responseTime = await getAvgResponseTime()
-  }
-  // Get chats count
-  result.chatCount = await Chat.count({})
-  // Get voice count
-  result.voiceCount = (await Voice.count({})) + extraVoiceCount
-  // Get houtly stats
-  const hourlyStats = (await getHourlyStats()).filter((s) => !!s.count)
-  const temp = hourlyStats.map((v) => v._id)
-  for (var i = 0; i <= 29; i++) {
-    if (!temp.includes(i)) {
-      hourlyStats.push({ _id: i, count: 0 })
+  try {
+    console.log('Generating new stats...');
+    
+    // Extra numbers of records that don't exist anymore after the cleanup but still contribute to the stats
+    const extraVoiceCount =
+      16472966 + 140155 + 10228067 + 24327202 + 23724547 + 48066867;
+    const extraDuration =
+      185936897 +
+      2245600 +
+      147045183 +
+      344688480 +
+      7780507 +
+      352478725 +
+      297266368;
+    
+    // Get result dummy variable
+    const result = {};
+    
+    // Get response stats
+    if (fs.existsSync(`${__dirname}/../../voicy/updates.log`)) {
+      try {
+        result.responseTime = await getAvgResponseTime();
+      } catch (err) {
+        console.warn('Failed to get response time stats:', err.message);
+        result.responseTime = null;
+      }
     }
+    
+    // Get chats count
+    result.chatCount = await Chat.countDocuments({});
+    
+    // Get voice count
+    result.voiceCount = (await Voice.countDocuments({})) + extraVoiceCount;
+    
+    // Get hourly stats
+    const hourlyStats = (await getHourlyStats()).filter((s) => !!s.count);
+    const temp = hourlyStats.map((v) => v._id);
+    for (var i = 0; i <= 29; i++) {
+      if (!temp.includes(i)) {
+        hourlyStats.push({ _id: i, count: 0 });
+      }
+    }
+    hourlyStats.sort((a, b) => a._id - b._id);
+    result.hourlyStats = hourlyStats.reverse();
+    
+    // Get duration
+    result.duration = (await getDuration()) + extraDuration;
+    
+    // Get chat daily stats
+    result.chatDailyStats = await getChatDailyStats();
+    
+    // Overwrite stats
+    let stats = await Stats.findOne({});
+    if (!stats) {
+      const newStats = new Stats({
+        json: JSON.stringify(result),
+      });
+      stats = await newStats.save();
+    } else {
+      stats.json = JSON.stringify(result);
+      stats = await stats.save();
+    }
+    
+    console.log('New stats generated successfully');
+    return stats;
+    
+  } catch (err) {
+    console.error('Error generating new stats:', err);
+    throw err;
   }
-  hourlyStats.sort((a, b) => a._id - b._id)
-  result.hourlyStats = hourlyStats.reverse()
-  // Get duration
-  result.duration = (await getDuration()) + extraDuration
-  // Get chat daily stats
-  result.chatDailyStats = await getChatDailyStats()
-  // Overwrite stats
-  const stats = await Stats.findOne({})
-  if (!stats) {
-    const newStats = new Stats({
-      json: JSON.stringify(result),
-    })
-    return newStats.save()
-  }
-  stats.json = JSON.stringify(result)
-  console.log('got new stats')
-  return stats.save()
 }
 
 async function getHourlyStats() {
@@ -241,46 +252,88 @@ async function getChatDailyStats() {
 }
 
 function getAvg(numbers) {
-  return (
-    numbers.reduce(function (p, c) {
-      return parseInt(p, 10) + parseInt(c, 10)
-    }, 0) / numbers.length
-  )
+  if (!Array.isArray(numbers) || numbers.length === 0) {
+    return 0;
+  }
+  
+  const validNumbers = numbers
+    .map(n => parseFloat(n))
+    .filter(n => !isNaN(n));
+    
+  if (validNumbers.length === 0) {
+    return 0;
+  }
+  
+  return validNumbers.reduce((sum, num) => sum + num, 0) / validNumbers.length;
 }
 
 function getAvgResponseTime() {
-  return new Promise((res, rej) => {
-    const fileStream = fs.createReadStream(
-      `${__dirname}/../../voicy/updates.log`
-    )
+  return new Promise((resolve, reject) => {
+    const filePath = `${__dirname}/../../voicy/updates.log`;
+    
+    if (!fs.existsSync(filePath)) {
+      return reject(new Error('Updates log file not found'));
+    }
 
+    const fileStream = fs.createReadStream(filePath);
     const rl = readline.createInterface({
       input: fileStream,
       crlfDelay: Infinity,
-    })
-    const timeReceivedMap = {}
+    });
+    
+    const timeReceivedMap = {};
+    let lineCount = 0;
+    
+    fileStream.on('error', (err) => {
+      reject(new Error(`Failed to read log file: ${err.message}`));
+    });
+
     rl.on('line', (line) => {
       if (!line) {
-        return
+        return;
       }
-      const [timeReceived, _, age] = line.replace('s', '').split(' — ')
-      if (timeReceived > Date.now() / 1000 - 60 * 60 * 24) {
-        // only last 24 hours
-        if (timeReceivedMap[timeReceived - (timeReceived % 60)]) {
-          timeReceivedMap[timeReceived - (timeReceived % 60)].push(age)
-        } else {
-          timeReceivedMap[timeReceived - (timeReceived % 60)] = [age]
+      
+      try {
+        lineCount++;
+        const parts = line.replace('s', '').split(' — ');
+        if (parts.length >= 3) {
+          const [timeReceived, _, age] = parts;
+          const timeReceivedNum = parseInt(timeReceived, 10);
+          const ageNum = parseFloat(age);
+          
+          if (!isNaN(timeReceivedNum) && !isNaN(ageNum)) {
+            if (timeReceivedNum > Date.now() / 1000 - 60 * 60 * 24) {
+              // only last 24 hours
+              const timeKey = timeReceivedNum - (timeReceivedNum % 60);
+              if (timeReceivedMap[timeKey]) {
+                timeReceivedMap[timeKey].push(ageNum);
+              } else {
+                timeReceivedMap[timeKey] = [ageNum];
+              }
+            }
+          }
         }
+      } catch (err) {
+        console.warn(`Error parsing line ${lineCount}:`, err.message);
       }
-    })
+    });
+    
     rl.on('close', () => {
-      for (const key of Object.keys(timeReceivedMap)) {
-        timeReceivedMap[key] = getAvg(timeReceivedMap[key])
+      try {
+        for (const key of Object.keys(timeReceivedMap)) {
+          timeReceivedMap[key] = getAvg(timeReceivedMap[key]);
+        }
+        console.log(`Processed ${lineCount} log lines, found ${Object.keys(timeReceivedMap).length} time buckets`);
+        resolve(timeReceivedMap);
+      } catch (err) {
+        reject(new Error(`Error processing response time data: ${err.message}`));
       }
-      console.log(timeReceivedMap)
-      res(timeReceivedMap)
-    })
-  })
+    });
+    
+    rl.on('error', (err) => {
+      reject(new Error(`Error reading log file: ${err.message}`));
+    });
+  });
 }
 
 /** Exports */
