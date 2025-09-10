@@ -16,7 +16,7 @@ function findChats(query) {
 }
 
 function countChats() {
-  return Chat.countDocuments({});
+  return Chat.estimatedDocumentCount();
 }
 
 function findVoices(query) {
