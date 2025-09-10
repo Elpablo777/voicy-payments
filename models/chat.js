@@ -10,9 +10,19 @@ const chatSchema = new Schema({
     index: true,
     validate: {
       validator: function(v) {
-        return /^-?\d+$/.test(v); // Telegram chat IDs are numeric strings
+        // Check numeric string format
+        if (!/^-?\d+$/.test(v)) return false;
+        try {
+          const id = BigInt(v);
+          // Telegram chat IDs are 64-bit signed integers
+          const min = BigInt('-9223372036854775808');
+          const max = BigInt('9223372036854775807');
+          return id >= min && id <= max;
+        } catch (e) {
+          return false;
+        }
       },
-      message: 'Chat ID must be a valid numeric string'
+      message: 'Chat ID must be a valid 64-bit signed integer string'
     }
   },
   engine: {
